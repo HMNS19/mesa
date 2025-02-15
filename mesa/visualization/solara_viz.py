@@ -23,14 +23,14 @@ See the Visualization Tutorial and example models for more details.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
+import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import reacton.core
 import solara
-import solara.lab
 
 import mesa.visualization.components.altair_components as components_altair
 from mesa.experimental.devs.simulator import Simulator
@@ -116,7 +116,6 @@ def SolaraViz(
     reactive_render_interval = solara.use_reactive(render_interval)
     with solara.AppBar():
         solara.AppBarTitle(name if name else model.value.__class__.__name__)
-        solara.lab.ThemeToggle()
 
     with solara.Sidebar(), solara.Column():
         with solara.Card("Controls"):
@@ -222,17 +221,20 @@ def ModelController(
     """
     playing = solara.use_reactive(False)
     running = solara.use_reactive(True)
+    render_trigger = solara.use_reactive(0)
     if model_parameters is None:
         model_parameters = {}
     model_parameters = solara.use_reactive(model_parameters)
+    stop_event = solara.use_memo(lambda: threading.Event(), [])
 
-    async def step():
-        while playing.value and running.value:
-            await asyncio.sleep(play_interval.value / 1000)
+    def step(stop_event: threading.Event):
+        while running.value and playing.value and not stop_event.is_set():
             do_step()
+            time.sleep(play_interval.value / 1000)
 
-    solara.lab.use_task(
-        step, dependencies=[playing.value, running.value], prefer_threaded=False
+    solara.use_effect(lambda: force_update(), [render_trigger.value])
+    solara.use_thread(
+        lambda: step(stop_event), dependencies=[running.value, playing.value]
     )
 
     @function_logger(__name__)
@@ -240,10 +242,8 @@ def ModelController(
         """Advance the model by the number of steps specified by the render_interval slider."""
         for _ in range(render_interval.value):
             model.value.step()
-
-        running.value = model.value.running
-
-        force_update()
+            running.value = model.value.running
+        render_trigger.set(render_trigger.value + 1)
 
     @function_logger(__name__)
     def do_reset():
@@ -301,36 +301,48 @@ def SimulatorController(
     """
     playing = solara.use_reactive(False)
     running = solara.use_reactive(True)
+    render_trigger = solara.use_reactive(0)
     if model_parameters is None:
         model_parameters = {}
     model_parameters = solara.use_reactive(model_parameters)
+    stop_event = solara.use_memo(lambda: threading.Event(), [])
 
-    async def step():
-        while playing.value and running.value:
-            await asyncio.sleep(play_interval.value / 1000)
-            do_step()
+    def step(stop_event: threading.Event):
+        while running.value and playing.value and not stop_event.is_set():
+            if playing.value:
+                do_step()
+                time.sleep(play_interval.value / 1000)
 
-    solara.lab.use_task(
-        step, dependencies=[playing.value, running.value], prefer_threaded=False
+    solara.use_effect(lambda: force_update(), [render_trigger.value])
+    solara.use_thread(
+        lambda: step(stop_event), dependencies=[running.value, playing.value]
     )
 
     def do_step():
         """Advance the model by the number of steps specified by the render_interval slider."""
-        simulator.run_for(render_interval.value)
-        running.value = model.value.running
-        force_update()
+        try:
+            if not stop_event.is_set():
+                simulator.run_for(render_interval.value)
+                running.value = model.value.running
+                render_trigger.set(render_trigger.value + 1)
+        finally:
+            stop_event.clear()
 
     def do_reset():
         """Reset the model to its initial state."""
         playing.value = False
         running.value = True
         simulator.reset()
-        model.value = model.value = model.value.__class__(
+        model.value = model.value.__class__(
             simulator=simulator, **model_parameters.value
         )
 
     def do_play_pause():
         """Toggle play/pause."""
+        if playing.value:
+            stop_event.set()
+        else:
+            stop_event.clear()
         playing.value = not playing.value
 
     with solara.Row(justify="space-between"):
